@@ -40,5 +40,5 @@ Chrome 虽好，但它现在越来越像一个“步入中年的优等生”—�
 ---
 
 ## 🤖 AI 协同声明
-* **产品经理/测试：** [填你的 GitHub 名字]
+* **产品经理/测试：** [lokfee46]
 * **主力程序员：** DeepSeek-V4-Pro (Reasoning Engine)
