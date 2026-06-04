@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ubiquitous Web Optimizer v2
 // @namespace    https://github.com/yourname/ubiquitous-web-optimizer
-// @version      2.0.0
-// @description  模块化重构：智能去广告 / 悬浮控制面板 (可拖拽+记忆) / 双击回顶 / 后台自动冻结定时器
+// @version      2.1.0
+// @description  模块化重构：智能去广告 / 悬浮控制面板 (可拖拽+记忆) / 双击回顶 / 后台自动冻结定时器 / 快捷网站管理
 // @author       You
 // @license      MIT
 // @match        *://*/*
@@ -22,10 +22,12 @@
             '[class*="ad-"]', '[id*="ad-"]', '[class*="sponsor"]',
             '[data-ad]', '[data-advertisement]', '[aria-label*="广告"]'
         ],
-        adExcludeSelectors: ['body', 'html', 'script', 'style', '#ub-optimizer-panel'], // 绝对不处理
+        adExcludeSelectors: ['body', 'html', 'script', 'style', '#ub-optimizer-panel', '.ub-quick-link', '.ub-quick-delete'], // 绝对不处理
         panelId: 'ub-optimizer-panel',
         nightStorageKey: 'ub-night-mode',
         panelPositionKey: 'ub-panel-pos',
+        quickLinksKey: 'ub-quick-links',
+        maxQuickLinks: 12,          // 最大快捷网站数量
         idleDeadline: 8               // requestIdleCallback 超时(ms)
     };
 
@@ -46,8 +48,17 @@
         try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
     }
 
+    // 提取主域名用于默认名称
+    function getHostname(url) {
+        try {
+            const a = document.createElement('a');
+            a.href = url;
+            return a.hostname.replace(/^www\./, '');
+        } catch { return '网站'; }
+    }
+
     /* ============================================
-       1. 定时器劫持与后台冻结（重写底层）
+       1. 定时器劫持与后台冻结（立即执行）
     ============================================ */
     class TimerManager {
         #origSetTimeout = window.setTimeout;
@@ -56,7 +67,7 @@
         #origClearInterval = window.clearInterval;
 
         #uid = 1;
-        #timers = new Map();          // id → { type, callbackRef, delay, args, realId, status, remaining }
+        #timers = new Map();          // id → { type, callback, delay, args, realId, status, remaining }
 
         constructor() {
             this.#hookTimers();
@@ -71,7 +82,6 @@
         #pauseAll() {
             for (const [id, timer] of this.#timers.entries()) {
                 if (timer.status !== 'active') continue;
-                // 计算剩余时间（近似）
                 timer.remaining = timer.type === 'timeout' ? timer.delay : timer.delay;
                 if (timer.realId !== null) {
                     if (timer.type === 'timeout') this.#origClearTimeout.call(window, timer.realId);
@@ -85,8 +95,8 @@
         #resumeAll() {
             for (const [id, timer] of this.#timers.entries()) {
                 if (timer.status !== 'paused') continue;
-                const callback = timer.callbackRef?.deref();
-                if (!callback) {
+                const callback = timer.callback;
+                if (typeof callback !== 'function') {
                     this.#timers.delete(id);
                     continue;
                 }
@@ -95,10 +105,9 @@
                     const newId = this.#origSetTimeout.call(window, (...args) => {
                         this.#timers.delete(id);
                         try { callback(...args); } catch (e) { console.error(e); }
-                    }, timer.remaining ?? timer.delay);
+                    }, timer.remaining ?? timer.delay, ...timer.args);
                     timer.realId = newId;
                 } else {
-                    // interval 重新启动，仍使用原始 delay
                     const newId = this.#origSetInterval.call(window, callback, timer.delay, ...timer.args);
                     timer.realId = newId;
                 }
@@ -114,7 +123,7 @@
                 const id = manager.#uid++;
                 const timer = {
                     type: 'timeout',
-                    callbackRef: new WeakRef(callback),
+                    callback,
                     delay: Math.max(0, delay || 0),
                     args,
                     realId: null,
@@ -140,7 +149,7 @@
                 const id = manager.#uid++;
                 const timer = {
                     type: 'interval',
-                    callbackRef: new WeakRef(callback),
+                    callback,
                     delay: Math.max(0, delay || 0),
                     args,
                     realId: null,
@@ -187,6 +196,8 @@
     class AdFilter {
         #observer = null;
         #hiddenAttr = 'data-ub-filtered';
+        #processingQueue = [];
+        #processing = false;
 
         constructor() {
             this.#initScan();
@@ -225,14 +236,56 @@
         }
 
         #processElement(el) {
-            // 递归处理子树，但若元素本身被隐藏则跳过子树
             if (this.#shouldHide(el)) {
                 this.#hideElement(el);
-                return;
+                return false; // 已隐藏，不再深入子节点
             }
-            // 检查子节点（只处理元素）
-            for (const child of el.children) {
-                this.#processElement(child);
+            return true; // 继续处理子节点
+        }
+
+        #processNodeRecursive(node) {
+            if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+            
+            // 使用迭代而非递归避免栈溢出（深度优先手动栈）
+            const stack = [node];
+            while (stack.length) {
+                const current = stack.pop();
+                if (!current) continue;
+                
+                const shouldContinue = this.#processElement(current);
+                if (shouldContinue && current.children) {
+                    // 倒序推入保持原顺序（不影响结果）
+                    for (let i = current.children.length - 1; i >= 0; i--) {
+                        stack.push(current.children[i]);
+                    }
+                }
+            }
+        }
+
+        #scheduleProcessing(node) {
+            this.#processingQueue.push(node);
+            if (!this.#processing) {
+                this.#processing = true;
+                if (window.requestIdleCallback) {
+                    requestIdleCallback(() => this.#drainQueue(), { timeout: CONFIG.idleDeadline });
+                } else {
+                    setTimeout(() => this.#drainQueue(), 16);
+                }
+            }
+        }
+
+        #drainQueue() {
+            const start = performance.now();
+            while (this.#processingQueue.length && (performance.now() - start) < 32) {
+                const node = this.#processingQueue.shift();
+                if (node && node.isConnected) {
+                    this.#processNodeRecursive(node);
+                }
+            }
+            if (this.#processingQueue.length) {
+                requestAnimationFrame(() => this.#drainQueue());
+            } else {
+                this.#processing = false;
             }
         }
 
@@ -242,17 +295,7 @@
                     requestAnimationFrame(scheduleScan);
                     return;
                 }
-                // 使用空闲回调分片处理大型DOM
-                const processChunk = (deadline) => {
-                    // 简单实现：直接全量处理（现代页面通常可接受）
-                    // 若要极致分片可改为队列遍历，这里不再增加复杂度
-                    this.#processElement(document.body);
-                };
-                if (window.requestIdleCallback) {
-                    requestIdleCallback(processChunk, { timeout: CONFIG.idleDeadline });
-                } else {
-                    setTimeout(processChunk, 1);
-                }
+                this.#scheduleProcessing(document.body);
             };
             if (document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', scheduleScan, { once: true });
@@ -265,8 +308,8 @@
             const onMutation = (mutations) => {
                 for (const m of mutations) {
                     for (const node of m.addedNodes) {
-                        if (node.nodeType === Node.ELEMENT_NODE) {
-                            this.#processElement(node);
+                        if (node.nodeType === Node.ELEMENT_NODE && node.isConnected) {
+                            this.#scheduleProcessing(node);
                         }
                     }
                 }
@@ -284,19 +327,22 @@
     }
 
     /* ============================================
-       3. 悬浮控制面板（可拖拽、夜间模式、回顶）
+       3. 悬浮控制面板（可拖拽、夜间模式、快捷网站）
     ============================================ */
     class FloatingPanel {
         #panel = null;
         #nightEnabled = false;
-        #dragState = null;          // { startX, startY, origLeft, origTop, pointerId }
+        #dragState = null;
+        #quickLinks = [];
 
         constructor() {
             this.#nightEnabled = safeGetStorage(CONFIG.nightStorageKey, false);
+            this.#quickLinks = safeGetStorage(CONFIG.quickLinksKey, []);
             this.#injectStyles();
             this.#createPanel();
-            this.#applyNightMode();       // 恢复夜间状态
+            this.#applyNightMode();
             this.#bindEvents();
+            this.#renderQuickLinks();
         }
 
         #injectStyles() {
@@ -322,21 +368,85 @@
                     user-select: none;
                     touch-action: none;
                     transition: opacity 0.2s;
+                    max-width: 280px;
+                    min-width: 200px;
                 }
                 #${CONFIG.panelId}.ub-dragging { opacity: 0.9; cursor: grabbing; }
                 #${CONFIG.panelId} .ub-btn {
                     background: rgba(255,255,255,0.55);
                     border: none; border-radius: 12px;
-                    padding: 10px 14px; font-size: 15px; font-weight: 500;
+                    padding: 8px 12px; font-size: 14px; font-weight: 500;
                     color: #1a1a1a; cursor: pointer;
                     backdrop-filter: blur(8px);
                     transition: background 0.15s;
                     white-space: nowrap;
                 }
                 #${CONFIG.panelId} .ub-btn:hover { background: rgba(255,255,255,0.8); }
+                #${CONFIG.panelId} .ub-section-title {
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: rgba(30,30,30,0.7);
+                    margin: 4px 0 0 0;
+                    letter-spacing: 0.5px;
+                }
+                #${CONFIG.panelId} .ub-quick-links {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 6px;
+                    max-height: 200px;
+                    overflow-y: auto;
+                }
+                #${CONFIG.panelId} .ub-quick-item {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    background: rgba(255,255,255,0.4);
+                    border-radius: 10px;
+                    padding: 4px 6px 4px 10px;
+                    transition: background 0.1s;
+                }
+                #${CONFIG.panelId} .ub-quick-item:hover {
+                    background: rgba(255,255,255,0.7);
+                }
+                #${CONFIG.panelId} .ub-quick-link {
+                    flex: 1;
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #1a1a1a;
+                    text-decoration: none;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                    cursor: pointer;
+                }
+                #${CONFIG.panelId} .ub-quick-delete {
+                    background: rgba(0,0,0,0.1);
+                    border: none;
+                    border-radius: 20px;
+                    width: 22px;
+                    height: 22px;
+                    font-size: 14px;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    transition: background 0.1s;
+                    color: #333;
+                }
+                #${CONFIG.panelId} .ub-quick-delete:hover {
+                    background: rgba(220,53,69,0.8);
+                    color: white;
+                }
+                #${CONFIG.panelId} .ub-add-link {
+                    background: rgba(255,255,255,0.5);
+                    border: 1px dashed rgba(0,0,0,0.2);
+                    margin-top: 2px;
+                    font-size: 12px;
+                    padding: 6px;
+                }
                 #${CONFIG.panelId} .ub-hint {
-                    margin: 0; font-size: 11px; color: rgba(30,30,30,0.65);
-                    text-align: center; line-height: 1.4;
+                    margin: 0; font-size: 10px; color: rgba(30,30,30,0.6);
+                    text-align: center; line-height: 1.3;
                 }
                 /* 夜间模式全局滤镜 */
                 html.ub-night-mode {
@@ -350,13 +460,13 @@
                 html.ub-night-mode [style*="background-image"] {
                     filter: invert(1) hue-rotate(180deg) !important;
                 }
-                /* 面板本身二次反转 */
                 html.ub-night-mode #${CONFIG.panelId} {
                     filter: invert(1) hue-rotate(180deg) !important;
                 }
                 @media (max-width: 600px) {
-                    #${CONFIG.panelId} { right: 8px; padding: 10px; gap: 8px; }
-                    #${CONFIG.panelId} .ub-btn { padding: 8px 12px; font-size: 14px; }
+                    #${CONFIG.panelId} { right: 8px; padding: 10px; gap: 8px; max-width: 240px; }
+                    #${CONFIG.panelId} .ub-btn { padding: 6px 10px; font-size: 13px; }
+                    #${CONFIG.panelId} .ub-quick-link { font-size: 12px; }
                 }
             `;
             document.head.appendChild(style);
@@ -366,23 +476,46 @@
             this.#panel = document.createElement('div');
             this.#panel.id = CONFIG.panelId;
 
+            // 夜间模式按钮
             const nightBtn = document.createElement('button');
             nightBtn.className = 'ub-btn';
             nightBtn.id = 'ub-night-btn';
             nightBtn.textContent = this.#nightEnabled ? '☀️ 日间模式' : '🌙 夜间模式';
 
+            // 返回顶部按钮
             const topBtn = document.createElement('button');
             topBtn.className = 'ub-btn';
             topBtn.textContent = '⬆ 返回顶部';
             topBtn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
 
+            // 快捷网站区域标题
+            const sectionTitle = document.createElement('div');
+            sectionTitle.className = 'ub-section-title';
+            sectionTitle.textContent = '⚡ 快捷网站';
+
+            // 快捷链接容器
+            const linksContainer = document.createElement('div');
+            linksContainer.className = 'ub-quick-links';
+
+            // 添加按钮
+            const addBtn = document.createElement('button');
+            addBtn.className = 'ub-btn ub-add-link';
+            addBtn.textContent = '+ 添加快捷网站';
+            addBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.#addQuickLink();
+            });
+
             const hint = document.createElement('p');
             hint.className = 'ub-hint';
-            hint.textContent = '双击空白·回顶 | 拖拽移动';
+            hint.textContent = '双击空白·回顶 | 拖拽面板';
 
-            this.#panel.append(nightBtn, topBtn, hint);
+            this.#panel.append(nightBtn, topBtn, sectionTitle, linksContainer, addBtn, hint);
+            
+            // 保存容器引用
+            this.#quickLinksContainer = linksContainer;
 
-            // 尝试恢复保存位置
+            // 恢复保存位置
             const savedPos = safeGetStorage(CONFIG.panelPositionKey);
             if (savedPos && savedPos.right != null && savedPos.top != null) {
                 this.#panel.style.right = savedPos.right;
@@ -395,6 +528,78 @@
                 else requestAnimationFrame(append);
             };
             append();
+        }
+
+        #renderQuickLinks() {
+            if (!this.#quickLinksContainer) return;
+            this.#quickLinksContainer.innerHTML = '';
+            
+            if (this.#quickLinks.length === 0) {
+                const emptyHint = document.createElement('div');
+                emptyHint.textContent = '暂无快捷网站，点击下方按钮添加';
+                emptyHint.style.fontSize = '11px';
+                emptyHint.style.color = 'rgba(0,0,0,0.5)';
+                emptyHint.style.textAlign = 'center';
+                emptyHint.style.padding = '6px';
+                this.#quickLinksContainer.appendChild(emptyHint);
+                return;
+            }
+
+            this.#quickLinks.forEach((link, index) => {
+                const item = document.createElement('div');
+                item.className = 'ub-quick-item';
+                
+                const linkEl = document.createElement('a');
+                linkEl.className = 'ub-quick-link';
+                linkEl.textContent = link.name || getHostname(link.url);
+                linkEl.title = link.url;
+                linkEl.href = link.url;
+                linkEl.target = '_blank';
+                linkEl.rel = 'noopener noreferrer';
+                linkEl.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    // 正常打开链接
+                });
+                
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'ub-quick-delete';
+                deleteBtn.textContent = '✕';
+                deleteBtn.title = '删除快捷方式';
+                deleteBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.#quickLinks.splice(index, 1);
+                    this.#saveQuickLinks();
+                    this.#renderQuickLinks();
+                });
+                
+                item.appendChild(linkEl);
+                item.appendChild(deleteBtn);
+                this.#quickLinksContainer.appendChild(item);
+            });
+        }
+
+        #addQuickLink() {
+            let url = prompt('请输入网站地址（URL）:', 'https://');
+            if (!url) return;
+            url = url.trim();
+            if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                url = 'https://' + url;
+            }
+            let name = prompt('请输入显示名称（可选）:', getHostname(url));
+            if (!name) name = getHostname(url);
+            
+            if (this.#quickLinks.length >= CONFIG.maxQuickLinks) {
+                alert(`最多添加 ${CONFIG.maxQuickLinks} 个快捷网站`);
+                return;
+            }
+            
+            this.#quickLinks.push({ id: Date.now() + Math.random(), name, url });
+            this.#saveQuickLinks();
+            this.#renderQuickLinks();
+        }
+
+        #saveQuickLinks() {
+            safeSetStorage(CONFIG.quickLinksKey, this.#quickLinks);
         }
 
         #toggleNightMode = () => {
@@ -427,10 +632,28 @@
             window.addEventListener('pointermove', this.#onDragMove.bind(this));
             window.addEventListener('pointerup', this.#onDragEnd.bind(this));
             window.addEventListener('pointercancel', this.#onDragEnd.bind(this));
+            
+            // 窗口resize时矫正位置边界
+            window.addEventListener('resize', () => this.#clampPosition());
+        }
+
+        #clampPosition() {
+            if (!this.#panel) return;
+            const rect = this.#panel.getBoundingClientRect();
+            const right = parseFloat(this.#panel.style.right) || 20;
+            const top = parseFloat(this.#panel.style.top) || (window.innerHeight / 2);
+            let newTop = top;
+            let newRight = right;
+            if (rect.height > window.innerHeight - 20) newTop = 20;
+            else newTop = Math.min(window.innerHeight - rect.height - 10, Math.max(10, top));
+            if (rect.width > window.innerWidth - 20) newRight = 10;
+            else newRight = Math.min(window.innerWidth - rect.width - 10, Math.max(0, right));
+            if (newTop !== top) this.#panel.style.top = newTop + 'px';
+            if (newRight !== right) this.#panel.style.right = newRight + 'px';
         }
 
         #onDragStart(e) {
-            if (e.target.closest('button')) return; // 按钮不触发拖拽
+            if (e.target.closest('button, a, .ub-quick-delete, .ub-quick-link')) return;
             const rect = this.#panel.getBoundingClientRect();
             this.#dragState = {
                 startX: e.clientX,
@@ -460,7 +683,6 @@
             if (!this.#dragState || e.pointerId !== this.#dragState.pointerId) return;
             this.#panel.classList.remove('ub-dragging');
             this.#panel.releasePointerCapture(e.pointerId);
-            // 保存位置
             const pos = {
                 right: this.#panel.style.right,
                 top: this.#panel.style.top
@@ -476,11 +698,8 @@
     function initDoubleTapToTop() {
         document.addEventListener('dblclick', (e) => {
             const target = e.target;
-            // 忽略面板内部
             if (target.closest(`#${CONFIG.panelId}`)) return;
-            // 忽略交互元素
             if (target.closest('a, button, input, textarea, select, [contenteditable="true"], [role="button"], label, summary, details')) return;
-            // 如果点击的是空白或者body/html
             if (target === document.body || target === document.documentElement || target.nodeType === Node.ELEMENT_NODE) {
                 e.preventDefault();
                 window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -489,13 +708,15 @@
     }
 
     /* ============================================
-       启动一切
+       启动一切（定时器立即劫持，其他延迟到 DOM 就绪）
     ============================================ */
+    // 立即劫持定时器（关键修复）
+    const timerManager = new TimerManager();
+    
     function bootstrap() {
-        new TimerManager();               // 最先劫持定时器
-        new AdFilter();                   // 广告过滤
-        new FloatingPanel();              // UI面板
-        initDoubleTapToTop();             // 双击事件
+        new AdFilter();
+        new FloatingPanel();
+        initDoubleTapToTop();
     }
 
     if (document.readyState === 'loading') {
